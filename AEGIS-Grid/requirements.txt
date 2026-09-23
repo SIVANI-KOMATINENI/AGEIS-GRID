@@ -1,0 +1,14 @@
+pandapower
+langgraph
+langchain-ollama
+langchain-core
+langchain
+neo4j
+streamlit
+pandas
+plotly
+pydantic
+python-dotenv
+numpy
+fastapi
+uvicorn
