@@ -22,6 +22,7 @@ class FinalDecision(BaseModel):
     provenance_result: ProvenanceResult
     behaviour_result: BehaviourResult
     risk_result: RiskResult
+    run_id: str = ""
 
 
 def make_decision(
@@ -43,7 +44,8 @@ def make_decision(
             final_decision="block",
             reason=f"Policy Override: {policy_res.reason}",
             action=action, policy_result=policy_res, provenance_result=prov_res, 
-            behaviour_result=behav_res, risk_result=risk_res
+            behaviour_result=behav_res, risk_result=risk_res,
+            run_id=action.run_id,
         )
         
     # 2. Risk Score Mapping
@@ -61,5 +63,6 @@ def make_decision(
         final_decision=decision,
         reason=reason,
         action=action, policy_result=policy_res, provenance_result=prov_res, 
-        behaviour_result=behav_res, risk_result=risk_res
+        behaviour_result=behav_res, risk_result=risk_res,
+        run_id=action.run_id,
     )

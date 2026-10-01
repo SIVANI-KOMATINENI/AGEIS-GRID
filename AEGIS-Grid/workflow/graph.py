@@ -250,9 +250,11 @@ Supports both:
 2. Explicit demonstration scenarios
 """
 
-from typing import TypedDict, Dict, Any, Optional
+from typing import TypedDict, Dict, Any, Optional, Literal
+from uuid import uuid4
 
 from langgraph.graph import StateGraph, END
+from pydantic import BaseModel, computed_field
 
 # Agents
 from agents.schemas import (
@@ -297,40 +299,47 @@ from database.models import (
 from provenance.neo4j_client import get_neo4j_client
 
 
-class AgentState(TypedDict):
-    """State shared across all nodes in the workflow."""
+class AttackContext(BaseModel):
+    is_injected_attack: bool = False
+    attack_type: Optional[str] = None
 
-    # Original observation from the microgrid
-    raw_observation: Dict[str, Any]
 
-    # Explicit demo scenario selected from main.py
-    # normal / sensor_poisoning / authority_spoofing
-    demo_scenario: Optional[str]
+class WorkflowResult(BaseModel):
+    aegis_result: FinalDecision
 
-    # Attack information after attack processing
-    active_attack_type: Optional[str]
-    is_injected_attack: int
+    @computed_field
+    @property
+    def proposed_action(self) -> ProposedAction:
+        return self.aegis_result.action
 
-    # Checkpoints
+    @computed_field
+    @property
+    def final_decision(self) -> Literal["allow", "block", "human_approval"]:
+        return self.aegis_result.final_decision
+
+
+class AgentState(TypedDict, total=False):
+    """Canonical state shared by the workflow nodes."""
+
     observation: Dict[str, Any]
-    monitoring_input: dict
-    diagnostic_report: dict
-    response_input: dict
-    proposed_action: dict
-
-    # AEGIS results
-    policy_res: dict
-    prov_res: dict
-    behav_res: dict
-    risk_res: dict
-    final_decision: dict
+    run_id: str
+    demo_scenario: Optional[str]
+    attack_context: AttackContext
+    monitoring_context: Dict[str, Any]
+    diagnostic_report: MonitoringReport
+    proposed_action: ProposedAction
+    policy_result: PolicyResult
+    provenance_result: ProvenanceResult
+    behaviour_result: BehaviourResult
+    risk_result: RiskResult
+    workflow_result: WorkflowResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NODE 1 — MICROGRID + ATTACK SCENARIO
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_microgrid_state(state: AgentState):
+def attack_manager_node(state: AgentState):
     """
     Node 1.
 
@@ -342,7 +351,9 @@ def get_microgrid_state(state: AgentState):
     In normal mode, the original Attack Scenario Manager remains active.
     """
 
-    obs = state["raw_observation"]
+    run_id = uuid4().hex
+    obs = dict(state["observation"])
+    obs["run_id"] = run_id
     timestamp = obs["timestamp"]
 
     demo_scenario = state.get("demo_scenario")
@@ -381,6 +392,22 @@ def get_microgrid_state(state: AgentState):
         0
     )
 
+    attack_context = AttackContext(
+        is_injected_attack=bool(is_injected),
+        attack_type=attack_type
+    )
+
+    modified_obs.pop("is_injected_attack", None)
+    modified_obs.pop("attack_type", None)
+
+    monitoring_context = {
+        "recent_history": query_recent_observations(5),
+        "context": {
+            "battery_normal_range_c": [20, 50],
+            "voltage_nom_pu": 1.0
+        }
+    }
+
     # ---------------------------------------------------------
     # STORE OBSERVATION
     # ---------------------------------------------------------
@@ -399,12 +426,13 @@ def get_microgrid_state(state: AgentState):
     # STORE ATTACK GROUND TRUTH
     # ---------------------------------------------------------
 
-    if is_injected and attack_type:
+    if attack_context.is_injected_attack and attack_context.attack_type:
 
         insert_attack_event(
             AttackEventRow(
-                attack_type=attack_type,
+                attack_type=attack_context.attack_type,
                 target="observation",
+                run_id=run_id,
                 start_time=timestamp,
                 end_time=timestamp
             )
@@ -412,8 +440,9 @@ def get_microgrid_state(state: AgentState):
 
     return {
         "observation": modified_obs,
-        "active_attack_type": attack_type,
-        "is_injected_attack": is_injected
+        "run_id": run_id,
+        "attack_context": attack_context,
+        "monitoring_context": monitoring_context
     }
 
 
@@ -432,16 +461,11 @@ def monitoring_agent_node(state: AgentState):
     the Response Agent.
     """
 
-    recent = query_recent_observations(5)
-
-    monitoring_input = {
-        "current": state["observation"],
-        "recent_history": recent,
-        "context": {
-            "battery_normal_range_c": [20, 50],
-            "voltage_nom_pu": 1.0
-        }
-    }
+    monitoring_input = MonitoringInput(
+        current=state["observation"],
+        recent_history=state["monitoring_context"]["recent_history"],
+        context=state["monitoring_context"]["context"]
+    )
 
     # Run Monitoring Agent
     report = run_monitoring_agent(
@@ -452,7 +476,7 @@ def monitoring_agent_node(state: AgentState):
     # CROSS-AGENT ATTACK
     # ---------------------------------------------------------
 
-    if state["active_attack_type"] == "cross_agent":
+    if state["attack_context"].attack_type == "cross_agent":
 
         report = apply_cross_agent(
             report
@@ -464,6 +488,7 @@ def monitoring_agent_node(state: AgentState):
 
     insert_agent_message(
         AgentMessageRow(
+            run_id=state["run_id"],
             timestamp=state["observation"]["timestamp"],
             sender_agent="monitoring_agent",
             receiver_agent="response_agent",
@@ -472,8 +497,7 @@ def monitoring_agent_node(state: AgentState):
     )
 
     return {
-        "monitoring_input": monitoring_input,
-        "diagnostic_report": report.model_dump()
+        "diagnostic_report": report
     }
 
 
@@ -492,19 +516,17 @@ def response_agent_node(state: AgentState):
     modifying/spoofing the authority associated with the proposed action.
     """
 
-    report = MonitoringReport(
-        **state["diagnostic_report"]
-    )
+    report = state["diagnostic_report"]
 
-    response_input = {
-        "diagnostic_report": report.model_dump(),
-        "current_state": {
+    response_input = ResponseInput(
+        diagnostic_report=report,
+        current_state={
             "battery_temperature_c":
                 state["observation"].get(
                     "battery_temperature_c"
                 )
         }
-    }
+    )
 
     # Run Response Agent
     action = run_response_agent(
@@ -515,7 +537,7 @@ def response_agent_node(state: AgentState):
     # AUTHORITY SPOOFING
     # ---------------------------------------------------------
 
-    if state["active_attack_type"] == "authority_spoofing":
+    if state["attack_context"].attack_type == "authority_spoofing":
 
         action = apply_authority_spoofing(
             action
@@ -527,6 +549,7 @@ def response_agent_node(state: AgentState):
 
     insert_agent_message(
         AgentMessageRow(
+            run_id=state["run_id"],
             timestamp=state["observation"]["timestamp"],
             sender_agent="response_agent",
             receiver_agent="aegis_grid",
@@ -534,9 +557,15 @@ def response_agent_node(state: AgentState):
         )
     )
 
+    neo = get_neo4j_client()
+    neo.log_action_provenance(
+        observation=state["observation"],
+        report=report.model_dump(),
+        proposed_action=action.model_dump(),
+    )
+
     return {
-        "response_input": response_input,
-        "proposed_action": action.model_dump()
+        "proposed_action": action
     }
 
 
@@ -552,16 +581,14 @@ def aegis_policy_node(state: AgentState):
     according to the configured rules.
     """
 
-    action = ProposedAction(
-        **state["proposed_action"]
-    )
+    action = state["proposed_action"]
 
     result = verify_policy(
         action
     )
 
     return {
-        "policy_res": result.model_dump()
+        "policy_result": result
     }
 
 
@@ -577,16 +604,14 @@ def aegis_provenance_node(state: AgentState):
     proposed action can be verified.
     """
 
-    action = ProposedAction(
-        **state["proposed_action"]
-    )
+    action = state["proposed_action"]
 
     result = verify_provenance(
         action
     )
 
     return {
-        "prov_res": result.model_dump()
+        "provenance_result": result
     }
 
 
@@ -601,16 +626,14 @@ def aegis_behaviour_node(state: AgentState):
     Checks whether the proposed action is behaviourally unusual.
     """
 
-    action = ProposedAction(
-        **state["proposed_action"]
-    )
+    action = state["proposed_action"]
 
     result = analyze_behaviour(
         action
     )
 
     return {
-        "behav_res": result.model_dump()
+        "behaviour_result": result
     }
 
 
@@ -625,17 +648,9 @@ def aegis_risk_node(state: AgentState):
     Combines policy, provenance and behaviour results into a risk score.
     """
 
-    policy = PolicyResult(
-        **state["policy_res"]
-    )
-
-    provenance = ProvenanceResult(
-        **state["prov_res"]
-    )
-
-    behaviour = BehaviourResult(
-        **state["behav_res"]
-    )
+    policy = state["policy_result"]
+    provenance = state["provenance_result"]
+    behaviour = state["behaviour_result"]
 
     result = evaluate_risk(
         policy,
@@ -644,7 +659,7 @@ def aegis_risk_node(state: AgentState):
     )
 
     return {
-        "risk_res": result.model_dump()
+        "risk_result": result
     }
 
 
@@ -664,25 +679,11 @@ def decision_controller_node(state: AgentState):
         HUMAN_APPROVAL
     """
 
-    action = ProposedAction(
-        **state["proposed_action"]
-    )
-
-    policy = PolicyResult(
-        **state["policy_res"]
-    )
-
-    provenance = ProvenanceResult(
-        **state["prov_res"]
-    )
-
-    behaviour = BehaviourResult(
-        **state["behav_res"]
-    )
-
-    risk = RiskResult(
-        **state["risk_res"]
-    )
+    action = state["proposed_action"]
+    policy = state["policy_result"]
+    provenance = state["provenance_result"]
+    behaviour = state["behaviour_result"]
+    risk = state["risk_result"]
 
     # Final AEGIS decision
     decision = make_decision(
@@ -700,6 +701,7 @@ def decision_controller_node(state: AgentState):
     # ---------------------------------------------------------
 
     row = AEGISDecisionRow(
+        run_id=state["run_id"],
         timestamp=timestamp,
         action_id=action.action_id,
         policy_result=policy.model_dump_json(),
@@ -709,8 +711,8 @@ def decision_controller_node(state: AgentState):
         final_decision=decision.final_decision,
         reason=decision.reason,
         human_reviewer=None,
-        is_injected_attack=state["is_injected_attack"],
-        attack_type=state["active_attack_type"]
+        is_injected_attack=int(state["attack_context"].is_injected_attack),
+        attack_type=state["attack_context"].attack_type
     )
 
     insert_aegis_decision(row)
@@ -721,11 +723,10 @@ def decision_controller_node(state: AgentState):
 
     neo = get_neo4j_client()
 
-    neo.log_full_action_chain(
-        observation=state["observation"],
-        report=state["diagnostic_report"],
-        proposed_action=state["proposed_action"],
-        aegis_decision=decision.model_dump()
+    neo.log_aegis_decision(
+        action_id=action.action_id,
+        aegis_decision=decision.model_dump(),
+        run_id=state["run_id"],
     )
 
     # Console output
@@ -737,7 +738,7 @@ def decision_controller_node(state: AgentState):
     )
 
     return {
-        "final_decision": decision.model_dump()
+        "workflow_result": WorkflowResult(aegis_result=decision)
     }
 
 
@@ -753,8 +754,8 @@ def build_workflow():
 
     # Nodes
     workflow.add_node(
-        "microgrid",
-        get_microgrid_state
+        "attack_manager",
+        attack_manager_node
     )
 
     workflow.add_node(
@@ -794,7 +795,7 @@ def build_workflow():
 
     # Sequential execution
     workflow.add_edge(
-        "microgrid",
+        "attack_manager",
         "monitor"
     )
 
@@ -834,7 +835,7 @@ def build_workflow():
     )
 
     workflow.set_entry_point(
-        "microgrid"
+        "attack_manager"
     )
 
     return workflow.compile()

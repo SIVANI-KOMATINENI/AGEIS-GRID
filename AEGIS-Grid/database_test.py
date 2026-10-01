@@ -1,100 +1,214 @@
-"""
-database_test.py - Milestone 2 verification script.
+"""Isolated tests for the SQLite schema and persistence helpers."""
 
-Run this to verify SQLite schema creation, inserts, and Neo4j connection handling.
-
-Usage:
-    python database_test.py
-"""
-
-import sys
-import os
 import json
+import sqlite3
+import tempfile
+import unittest
 from pathlib import Path
 
-# Ensure project root is on path
-_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(_ROOT))
+from agents.schemas import MonitoringReport, ProposedAction
+from aegis.behaviour import BehaviourResult
+from aegis.policy import PolicyResult
+from aegis.provenance import ProvenanceResult
+from aegis.risk import RiskResult
+from database.models import (
+    AEGISDecisionRow,
+    AgentMessageRow,
+    AttackEventRow,
+    ObservationRow,
+)
+from database.sqlite import (
+    init_db,
+    insert_aegis_decision,
+    insert_agent_message,
+    insert_attack_event,
+    insert_observation,
+    query_recent_agent_messages,
+    query_recent_attack_events,
+    query_recent_decisions,
+    query_recent_observations,
+)
 
-from database.models import ObservationRow, AgentMessageRow, AEGISDecisionRow
-from database.sqlite import init_db, insert_observation, insert_agent_message, insert_aegis_decision, query_recent_observations
-from provenance.neo4j_client import get_neo4j_client
-import config as cfg
 
-def test_database():
-    print("=" * 60)
-    print("AEGIS Grid - Milestone 2: Database Layer Test")
-    print("=" * 60)
+class SQLitePersistenceTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "nested" / "audit.db")
+        init_db(self.db_path)
 
-    # 1. SQLite Testing
-    # Ensure a fresh db for testing
-    test_db_path = "data/logs/test_aegis_audit.db"
-    
-    # Clean up old test db if it exists
-    if os.path.exists(test_db_path):
-        os.remove(test_db_path)
+    def tearDown(self):
+        self.temp_dir.cleanup()
 
-    print("\n1. Initialising SQLite Database...")
-    init_db(test_db_path, wipe_existing=True)
-    print(f"[OK] Database created at {test_db_path}")
+    def test_initialization_creates_four_tables(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        finally:
+            connection.close()
+        self.assertTrue(
+            {"observations", "agent_messages", "attack_events", "aegis_decisions"}
+            <= tables
+        )
 
-    print("\n2. Testing Inserts...")
-    obs = ObservationRow(
-        timestamp="12:00",
-        voltage_pu=1.02,
-        load_kw=45.0,
-        solar_kw=10.0,
-        battery_soc_pct=85.0,
-        battery_temperature_c=31.2,
-        transformer_loading_pct=15.0
-    )
-    obs_id = insert_observation(obs, test_db_path)
-    print(f"[OK] Inserted observation, got ID: {obs_id}")
+    def test_init_adds_run_id_to_legacy_table_without_losing_rows(self):
+        legacy_path = str(Path(self.temp_dir.name) / "legacy.db")
+        connection = sqlite3.connect(legacy_path)
+        connection.execute(
+            """CREATE TABLE observations (
+                obs_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                voltage_pu REAL,
+                load_kw REAL,
+                solar_kw REAL,
+                battery_soc_pct REAL,
+                battery_temperature_c REAL,
+                transformer_loading_pct REAL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO observations (timestamp, voltage_pu) VALUES (?, ?)",
+            ("09:00", 1.01),
+        )
+        connection.commit()
+        connection.close()
 
-    msg = AgentMessageRow(
-        timestamp="12:01",
-        sender_agent="monitoring_agent",
-        receiver_agent="response_agent",
-        message_content=json.dumps({"status": "NORMAL"})
-    )
-    msg_id = insert_agent_message(msg, test_db_path)
-    print(f"[OK] Inserted agent message, got ID: {msg_id}")
+        init_db(legacy_path)
 
-    dec = AEGISDecisionRow(
-        timestamp="12:02",
-        action_id="action_001",
-        policy_result='{"decision": "allow"}',
-        provenance_result='{"verified": true}',
-        behaviour_flag=0,
-        risk_score=0.1,
-        final_decision="allow",
-        reason="All checks passed.",
-        is_injected_attack=0
-    )
-    dec_id = insert_aegis_decision(dec, test_db_path)
-    print(f"[OK] Inserted AEGIS decision, got ID: {dec_id}")
+        connection = sqlite3.connect(legacy_path)
+        try:
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(observations)")
+            }
+            row = connection.execute(
+                "SELECT timestamp, voltage_pu, run_id FROM observations"
+            ).fetchone()
+        finally:
+            connection.close()
 
-    print("\n3. Testing Query...")
-    recent_obs = query_recent_observations(5, test_db_path)
-    print(f"[OK] Retrieved {len(recent_obs)} recent observations")
-    assert recent_obs[0]["voltage_pu"] == 1.02
+        self.assertIn("run_id", columns)
+        self.assertEqual(row, ("09:00", 1.01, None))
 
-    # Clean up test db
-    if os.path.exists(test_db_path):
-        os.remove(test_db_path)
+    def test_observation_insert_and_retrieval(self):
+        observation = ObservationRow(
+            run_id="run-observation",
+            timestamp="10:00",
+            voltage_pu=1.02,
+            load_kw=45.0,
+            solar_kw=10.0,
+            battery_soc_pct=85.0,
+            battery_temperature_c=31.2,
+            transformer_loading_pct=15.0,
+        )
+        insert_observation(observation, self.db_path)
+        rows = query_recent_observations(5, self.db_path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "10:00")
+        self.assertEqual(rows[0]["run_id"], "run-observation")
+        self.assertEqual(rows[0]["battery_temperature_c"], 31.2)
 
-    # 2. Neo4j Testing
-    print("\n4. Testing Neo4j Client Initialization...")
-    neo_client = get_neo4j_client()
-    if neo_client.driver:
-        print("[OK] Neo4j is connected!")
-    else:
-        print("[WARNING] Neo4j is not reachable. This is fine for now; the client gracefully falls back to mock logic.")
-        print("          Before running the full system or attacks, please ensure Neo4j is running at:", cfg.NEO4J_URI)
+    def test_agent_messages_are_model_json_and_queryable(self):
+        report = MonitoringReport(
+            run_id="run-messages",
+            report_id="rep_10:00",
+            timestamp="10:00",
+            status="NORMAL",
+            severity="NONE",
+            confidence=1.0,
+        )
+        action = ProposedAction(
+            action_id="act_10:00",
+            run_id="run-messages",
+            action_type="MAINTAIN_STATUS",
+            target="none",
+            reason="Normal operation.",
+            priority="LOW",
+        )
+        for sender, receiver, model in (
+            ("monitoring_agent", "response_agent", report),
+            ("response_agent", "aegis_grid", action),
+        ):
+            insert_agent_message(
+                AgentMessageRow(
+                    run_id="run-messages",
+                    timestamp="10:00",
+                    sender_agent=sender,
+                    receiver_agent=receiver,
+                    message_content=model.model_dump_json(),
+                ),
+                self.db_path,
+            )
 
-    print("\n" + "=" * 60)
-    print("Milestone 2 COMPLETE - database layer is working correctly.")
-    print("=" * 60)
+        messages = query_recent_agent_messages(5, self.db_path)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0]["receiver_agent"], "response_agent")
+        self.assertEqual(messages[1]["receiver_agent"], "aegis_grid")
+        self.assertEqual({message["run_id"] for message in messages}, {"run-messages"})
+        self.assertEqual(json.loads(messages[0]["message_content"])["status"], "NORMAL")
+        self.assertEqual(json.loads(messages[1]["message_content"])["action_id"], "act_10:00")
+
+    def test_attack_event_ground_truth(self):
+        insert_attack_event(
+            AttackEventRow(
+                run_id="run-attack",
+                attack_type="sensor_poisoning",
+                target="observation",
+                start_time="02:21",
+                end_time="02:21",
+            ),
+            self.db_path,
+        )
+        events = query_recent_attack_events(5, self.db_path)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["attack_type"], "sensor_poisoning")
+        self.assertEqual(events[0]["ground_truth"], 1)
+        self.assertEqual(events[0]["run_id"], "run-attack")
+        self.assertEqual(events[0]["start_time"], events[0]["end_time"])
+
+    def test_decision_json_and_fields_are_queryable(self):
+        policy = PolicyResult(decision="allow", reason="Policy passed.")
+        provenance = ProvenanceResult(
+            verified=True,
+            trace_length=1,
+            reason="Verified.",
+        )
+        behaviour = BehaviourResult(flagged=False)
+        risk = RiskResult(
+            score=0.0,
+            band="LOW",
+            contributing_factors={"policy": 0.0, "provenance": 0.0, "behaviour": 0.0},
+        )
+        insert_aegis_decision(
+            AEGISDecisionRow(
+                run_id="run-decision",
+                timestamp="10:00",
+                action_id="act_10:00",
+                policy_result=policy.model_dump_json(),
+                provenance_result=provenance.model_dump_json(),
+                behaviour_flag=int(behaviour.flagged),
+                risk_score=risk.score,
+                final_decision="allow",
+                reason="Approved.",
+                human_reviewer=None,
+                is_injected_attack=0,
+                attack_type=None,
+            ),
+            self.db_path,
+        )
+        decisions = query_recent_decisions(5, self.db_path)
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(json.loads(decisions[0]["policy_result"])["decision"], "allow")
+        self.assertTrue(json.loads(decisions[0]["provenance_result"])["verified"])
+        self.assertEqual(decisions[0]["final_decision"], "allow")
+        self.assertEqual(decisions[0]["run_id"], "run-decision")
+        self.assertEqual(decisions[0]["is_injected_attack"], 0)
+        self.assertIsNone(decisions[0]["human_reviewer"])
+
 
 if __name__ == "__main__":
-    test_database()
+    unittest.main()

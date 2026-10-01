@@ -21,13 +21,15 @@ from agents.schemas import MonitoringInput, MonitoringReport
 from agents.prompts import MONITORING_SYSTEM_PROMPT
 
 
-def run_monitoring_agent(inputs: dict) -> MonitoringReport:
+def run_monitoring_agent(
+    inputs: MonitoringInput | dict[str, Any]
+) -> MonitoringReport:
     """
     Executes the Monitoring Agent using a local Ollama model.
     Falls back to a safe mock if the LLM is unreachable or fails to output correct JSON.
     """
     # 1. Prepare data
-    agent_input = MonitoringInput(**inputs)
+    agent_input = MonitoringInput.model_validate(inputs)
     
     # 2. Configure Local LLM with structured output
     llm = ChatOllama(
@@ -61,6 +63,9 @@ def run_monitoring_agent(inputs: dict) -> MonitoringReport:
         # Ensure timestamp matches current observation
         if "timestamp" not in data or not data["timestamp"]:
             data["timestamp"] = agent_input.current.get("timestamp", "unknown")
+
+        data["report_id"] = f"rep_{data['timestamp']}"
+        data["run_id"] = agent_input.current.get("run_id", "")
             
         return MonitoringReport(**data)
         
@@ -78,6 +83,8 @@ def _fallback_rule_based_diagnosis(agent_input: MonitoringInput) -> MonitoringRe
     # Simple check for overheating battery (the main scenario in the spec)
     if curr.get("battery_temperature_c", 30.0) > 60.0:
         return MonitoringReport(
+            run_id=curr.get("run_id", ""),
+            report_id=f"rep_{timestamp}",
             timestamp=timestamp,
             status="ANOMALY",
             severity="HIGH",
@@ -88,6 +95,8 @@ def _fallback_rule_based_diagnosis(agent_input: MonitoringInput) -> MonitoringRe
         )
         
     return MonitoringReport(
+        run_id=curr.get("run_id", ""),
+        report_id=f"rep_{timestamp}",
         timestamp=timestamp,
         status="NORMAL",
         severity="NONE",

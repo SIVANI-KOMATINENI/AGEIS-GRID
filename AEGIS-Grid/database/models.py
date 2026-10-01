@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 class ObservationRow(BaseModel):
     """Maps to the `observations` SQLite table."""
+    run_id: Optional[str] = None
     timestamp: str
     voltage_pu: float
     load_kw: float
@@ -24,6 +25,7 @@ class ObservationRow(BaseModel):
 
 class AgentMessageRow(BaseModel):
     """Maps to the `agent_messages` SQLite table."""
+    run_id: Optional[str] = None
     timestamp: str
     sender_agent: str
     receiver_agent: str
@@ -32,6 +34,7 @@ class AgentMessageRow(BaseModel):
 
 class AttackEventRow(BaseModel):
     """Maps to the `attack_events` SQLite table."""
+    run_id: Optional[str] = None
     attack_type: str
     target: str
     start_time: str
@@ -41,6 +44,7 @@ class AttackEventRow(BaseModel):
 
 class AEGISDecisionRow(BaseModel):
     """Maps to the `aegis_decisions` SQLite table."""
+    run_id: Optional[str] = None
     timestamp: str
     action_id: str
     policy_result: str          # JSON-serialized PolicyResult

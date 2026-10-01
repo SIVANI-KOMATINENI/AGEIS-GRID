@@ -66,6 +66,13 @@ class MonitoringInput(BaseModel):
 
 class MonitoringReport(BaseModel):
     agent: str = Field(default="monitoring_agent")
+    run_id: str = Field(
+        default="",
+        description="Unique identifier for the workflow execution",
+    )
+    report_id: str = Field(
+        description="Stable identifier for this diagnostic report"
+    )
     timestamp: str = Field(
         description="The timestamp of the observation being analysed"
     )
@@ -102,6 +109,11 @@ class ResponseInput(BaseModel):
 class ProposedAction(BaseModel):
     action_id: str = Field(
         description="Unique ID for this action proposal, e.g. act_13:30"
+    )
+
+    run_id: str = Field(
+        default="",
+        description="Workflow execution identifier inherited from the report",
     )
 
     sender_agent: str = Field(

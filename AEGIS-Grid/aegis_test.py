@@ -30,27 +30,26 @@ def test():
     print("=" * 60)
     reset_behaviour_history()
 
-    print("\nTest 1: Normal Benign Action (EXPECT ALLOW)")
+    print("\nTest 1: Benign Action Without Provenance (EXPECT HUMAN_APPROVAL)")
     act1 = ProposedAction(
         action_id="act1", action_type="MAINTAIN_STATUS", target="none", 
         reason="looks good", priority="LOW"
     )
     res1 = run_pipeline(act1)
     print(f" -> Decision: {res1.final_decision.upper()} | Reason: {res1.reason}")
-    assert res1.final_decision == "allow"
+    assert res1.final_decision == "human_approval"
 
-    print("\nTest 2: Valid Emergency Action (EXPECT ALLOW)")
+    print("\nTest 2: Emergency Action With Missing Provenance (EXPECT HUMAN_APPROVAL)")
     act2 = ProposedAction(
         action_id="act2", action_type="ISOLATE_BATTERY", target="battery_1", 
         reason="Fire!", priority="HIGH", claimed_authorization="real_report_id"
     )
-    # The neo4j test client isn't connected so verify_provenance returns True as a graceful fallback.
-    # Therefore, this should pass. Behaviour check WILL flag it because HIGH priority wasn't seen before.
-    # But because behaviour weight is 0.2, Risk = 0.2 -> LOW band -> ALLOW.
+    # Neo4j must contain this report linked to the action; this standalone test
+    # deliberately creates no provenance and therefore expects escalation.
     res2 = run_pipeline(act2)
     print(f" -> Decision: {res2.final_decision.upper()} | Reason: {res2.reason}")
     print(f"    Risk Band: {res2.risk_result.band} (Score: {res2.risk_result.score})")
-    assert res2.final_decision == "allow"
+    assert res2.final_decision == "human_approval"
 
     print("\nTest 3: Missing Authority on severe action (EXPECT BLOCK)")
     act3 = ProposedAction(

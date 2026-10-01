@@ -132,6 +132,7 @@ The Response and Maintenance Agent logic.
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 # Add project root to path when running as script
 _ROOT = Path(__file__).resolve().parent.parent
@@ -146,7 +147,9 @@ from agents.schemas import ResponseInput, ProposedAction
 from agents.prompts import RESPONSE_SYSTEM_PROMPT
 
 
-def run_response_agent(inputs: dict) -> ProposedAction:
+def run_response_agent(
+    inputs: ResponseInput | dict[str, Any]
+) -> ProposedAction:
     """
     Executes the Response Agent using a local Ollama model.
 
@@ -154,7 +157,7 @@ def run_response_agent(inputs: dict) -> ProposedAction:
     the LLM is unavailable or produces invalid output.
     """
 
-    agent_input = ResponseInput(**inputs)
+    agent_input = ResponseInput.model_validate(inputs)
 
     llm = ChatOllama(
         base_url=cfg.OLLAMA_BASE_URL,
@@ -208,9 +211,6 @@ Important output rules:
     try:
         report = agent_input.diagnostic_report
 
-        # Deterministic report identifier
-        report_id = f"rep_{report.timestamp}"
-
         response = chain.invoke({
             "report": report.model_dump_json(indent=2),
             "state": json.dumps(
@@ -228,9 +228,10 @@ Important output rules:
 
         # Enforce deterministic identifiers.
         data["action_id"] = f"act_{report.timestamp}"
+        data["run_id"] = report.run_id
 
         # Do not allow the LLM to invent the authorization identifier.
-        data["claimed_authorization"] = report_id
+        data["claimed_authorization"] = report.report_id
 
         return ProposedAction(**data)
 
@@ -251,8 +252,6 @@ def _fallback_rule_based_response(
     report = agent_input.diagnostic_report
 
     action_id = f"act_{report.timestamp}"
-    report_id = f"rep_{report.timestamp}"
-
     if report.status == "ANOMALY":
 
         if (
@@ -262,6 +261,7 @@ def _fallback_rule_based_response(
 
             return ProposedAction(
                 action_id=action_id,
+                run_id=report.run_id,
                 action_type="ISOLATE_BATTERY",
                 target="battery_1",
                 reason=(
@@ -272,27 +272,29 @@ def _fallback_rule_based_response(
                     )
                 ),
                 priority="HIGH",
-                claimed_authorization=report_id
+                claimed_authorization=report.report_id
             )
 
         return ProposedAction(
             action_id=action_id,
+            run_id=report.run_id,
             action_type="INVESTIGATE",
             target="unknown",
             reason="Fallback response for anomaly.",
             priority="MEDIUM",
-            claimed_authorization=report_id
+            claimed_authorization=report.report_id
         )
 
     # Normal state
 
     return ProposedAction(
         action_id=action_id,
+        run_id=report.run_id,
         action_type="MAINTAIN_STATUS",
         target="none",
         reason="System operating normally.",
         priority="LOW",
-        claimed_authorization=report_id
+        claimed_authorization=report.report_id
     )
 
 
@@ -305,6 +307,7 @@ if __name__ == "__main__":
     from agents.schemas import MonitoringReport
 
     report = MonitoringReport(
+        report_id="rep_12:00",
         timestamp="12:00",
         status="ANOMALY",
         severity="HIGH",

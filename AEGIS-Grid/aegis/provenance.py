@@ -20,44 +20,46 @@ class ProvenanceResult(BaseModel):
 
 def verify_provenance(action: ProposedAction) -> ProvenanceResult:
     """
-    Checks if the action's claimed_authorization actually exists in the Neo4j graph.
-    If the agent invents a fake report ID or timestamp, this blocks it.
+    Checks that the claimed report is linked to this action in Neo4j.
     """
     auth = action.claimed_authorization
 
     if not auth:
-        # No auth claimed. Policy layer already handles if this is allowed for benign actions.
-        # If we reach here for a benign action (e.g. low priority MAINTAIN), we should not penalize risk.
         return ProvenanceResult(
-            verified=True,  # Set to True so it doesn't trigger the 40% risk penalty
+            verified=False,
             trace_length=0,
-            reason="No authorization claimed; treated as unverified but forgiven by provenance logic."
+            reason="Provenance verification failed: action has no claimed report."
         )
 
     neo = get_neo4j_client()
     if not neo.driver:
-        # If DB is down, fallback logic (so project doesn't crash during evaluation of other modules)
-        return ProvenanceResult(
-            verified=True, 
-            trace_length=0, 
-            reason="Neo4j offline. Skipping provenance requirement."
-        )
-
-    is_valid = neo.verify_authorization(auth)
-    
-    if is_valid:
-        # Optionally, we could gather the trace length, but for now we just care about boolean existance.
-        return ProvenanceResult(
-            verified=True,
-            trace_length=2, 
-            reason=f"Authorization '{auth}' verified against provenance graph."
-        )
-    else:
         return ProvenanceResult(
             verified=False,
             trace_length=0,
-            reason=f"AUTHORITY SPOOFING DETECTED: Claimed authorization '{auth}' does not exist in provenance graph."
+            reason="Provenance verification failed: Neo4j is unavailable."
         )
+
+    status = neo.authorization_status(auth, action.action_id, action.run_id)
+
+    if status == "verified":
+        return ProvenanceResult(
+            verified=True,
+            trace_length=3,
+            reason="Provenance verified: action is linked to the claimed report in Neo4j."
+        )
+
+    if status == "report_missing":
+        reason = "Provenance verification failed: claimed report does not exist."
+    elif status == "unlinked":
+        reason = "Provenance verification failed: report exists but is not linked to this action."
+    else:
+        reason = "Provenance verification failed: complete action provenance could not be verified."
+
+    return ProvenanceResult(
+        verified=False,
+        trace_length=0,
+        reason=reason
+    )
 
 if __name__ == "__main__":
     test_action = ProposedAction(

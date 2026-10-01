@@ -542,36 +542,8 @@ def main():
     # ---------------------------------------------------------
 
     initial_state = {
-
-        "raw_observation": observation,
-
-        # Explicit demonstration scenario
-        "demo_scenario": scenario,
-
-        # Filled by workflow
-        "active_attack_type": None,
-
-        "is_injected_attack": 0,
-
-        "observation": {},
-
-        "monitoring_input": {},
-
-        "diagnostic_report": {},
-
-        "response_input": {},
-
-        "proposed_action": {},
-
-        "policy_res": {},
-
-        "prov_res": {},
-
-        "behav_res": {},
-
-        "risk_res": {},
-
-        "final_decision": {}
+        "observation": observation,
+        "demo_scenario": scenario
     }
 
     # ---------------------------------------------------------
@@ -602,6 +574,8 @@ def main():
         initial_state
     )
 
+    result = final_state["workflow_result"]
+
     # ---------------------------------------------------------
     # 7. ATTACK STATUS
     # ---------------------------------------------------------
@@ -610,14 +584,9 @@ def main():
     print("ATTACK STATUS")
     print("=" * 60)
 
-    active_attack = final_state.get(
-        "active_attack_type"
-    )
-
-    injected = final_state.get(
-        "is_injected_attack",
-        0
-    )
+    attack_context = final_state["attack_context"]
+    active_attack = attack_context.attack_type
+    injected = attack_context.is_injected_attack
 
     print(
         "Attack type :", 
@@ -633,9 +602,7 @@ def main():
     # 8. MONITORING AGENT
     # ---------------------------------------------------------
 
-    report = final_state[
-        "diagnostic_report"
-    ]
+    report = final_state["diagnostic_report"].model_dump()
 
     print("\n" + "=" * 60)
     print("MONITORING AGENT RESULT")
@@ -665,9 +632,7 @@ def main():
     # 9. RESPONSE AGENT
     # ---------------------------------------------------------
 
-    action = final_state[
-        "proposed_action"
-    ]
+    action = result.proposed_action.model_dump()
 
     print("\n" + "=" * 60)
     print("RESPONSE AGENT - PROPOSED ACTION")
@@ -712,25 +677,12 @@ def main():
     # 10. AEGIS SECURITY RESULTS
     # ---------------------------------------------------------
 
-    policy = final_state[
-        "policy_res"
-    ]
-
-    provenance = final_state[
-        "prov_res"
-    ]
-
-    behaviour = final_state[
-        "behav_res"
-    ]
-
-    risk = final_state[
-        "risk_res"
-    ]
-
-    decision = final_state[
-        "final_decision"
-    ]
+    aegis_result = result.aegis_result
+    policy = aegis_result.policy_result.model_dump()
+    provenance = aegis_result.provenance_result.model_dump()
+    behaviour = aegis_result.behaviour_result.model_dump()
+    risk = aegis_result.risk_result.model_dump()
+    decision = aegis_result.model_dump()
 
     print("\n" + "=" * 60)
     print("AEGIS SECURITY ANALYSIS")
@@ -739,8 +691,8 @@ def main():
     print("\nPOLICY")
 
     print(
-        "    Allowed :",
-        policy.get("allowed")
+        "    Decision :",
+        policy.get("decision")
     )
 
     print(
@@ -769,7 +721,7 @@ def main():
 
     print(
         "    Reason  :",
-        behaviour.get("reason")
+        behaviour.get("deviation_reason")
     )
 
     print("\nRISK")
@@ -780,18 +732,15 @@ def main():
     )
 
     print(
-        "    Level :",
-        risk.get("level")
+        "    Band :",
+        risk.get("band")
     )
 
     # ---------------------------------------------------------
     # 11. FINAL DECISION
     # ---------------------------------------------------------
 
-    final_decision = decision.get(
-        "final_decision",
-        ""
-    )
+    final_decision = result.final_decision
 
     print("\nFINAL DECISION")
 
