@@ -4,7 +4,6 @@ The Decision Controller. Aggregates all AEGIS elements to make the final determi
 """
 
 from typing import Optional
-# pyrefly: ignore [missing-import]
 from pydantic import BaseModel
 
 from agents.schemas import ProposedAction
@@ -35,6 +34,7 @@ def make_decision(
     """
     Final Logic Gate.
     A hard policy BLOCK overrides a low risk score.
+    A policy HUMAN_APPROVAL overrides a low risk score, but a HIGH risk score can still BLOCK it.
     Otherwise, it maps the risk band to the resolution action.
     """
     
@@ -52,9 +52,13 @@ def make_decision(
     if risk_res.band == "HIGH":
         decision = "block"
         reason = "Blocked due to HIGH aggregate risk score."
-    elif risk_res.band == "MEDIUM":
+    elif risk_res.band == "MEDIUM" or policy_res.decision == "human_approval":
+        # If policy demands human approval, we do it even if risk is low (as long as it wasn't blocked above)
         decision = "human_approval"
-        reason = "Escalated for human approval due to MEDIUM aggregate risk score."
+        if policy_res.decision == "human_approval":
+             reason = f"Escalated for human approval due to Policy: {policy_res.reason}"
+        else:
+             reason = "Escalated for human approval due to MEDIUM aggregate risk score."
     else:
         decision = "allow"
         reason = "Action approved. Low risk and policy compliant."

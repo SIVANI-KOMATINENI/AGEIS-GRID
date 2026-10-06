@@ -2,6 +2,7 @@
 aegis/policy.py
 Policy Verification Stage.
 Fast, deterministic rule checking - no LLM needed.
+Now supports 'human_approval' as a direct policy outcome.
 """
 
 from pydantic import BaseModel
@@ -11,7 +12,7 @@ from agents.schemas import ProposedAction
 
 class PolicyResult(BaseModel):
     stage: str = "policy"
-    decision: str    # "allow" | "block"
+    decision: str    # "allow" | "block" | "human_approval"
     matched_rule_id: Optional[str] = None
     reason: str
 
@@ -23,8 +24,8 @@ DEFAULT_RULES = [
         "rule_id": "rule_001",
         "description": "Critical-load shutdown always requires Human Approval",
         "condition": lambda action: action.target == "critical_load" and action.action_type == "SHUTDOWN_LOAD",
-        "action": "block",
-        "reason": "Policy explicitly forbids auto-shutdown of critical load."
+        "action": "human_approval",
+        "reason": "Policy explicitly forbids auto-shutdown of critical load. Human review required."
     },
     {
         "rule_id": "rule_002",
@@ -36,7 +37,7 @@ DEFAULT_RULES = [
     {
         "rule_id": "rule_003",
         "description": "Known safe actions",
-        "condition": lambda action: action.action_type in ["MAINTAIN_STATUS", "INSPECT", "LOG_WARNING"],
+        "condition": lambda action: action.action_type in ["MAINTAIN_STATUS", "INSPECT", "LOG_WARNING", "INVESTIGATE"],
         "action": "allow",
         "reason": "Benign observation/maintenance action."
     },
@@ -46,7 +47,22 @@ DEFAULT_RULES = [
         "condition": lambda action: action.priority in ["MEDIUM", "HIGH"] and not action.claimed_authorization,
         "action": "block",
         "reason": "Severe action proposed without claiming proper authorization (missing diagnostic report ID)."
-    }
+    },
+    # --- New Rules ---
+    {
+        "rule_id": "rule_005",
+        "description": "Unknown action types escalate to human",
+        "condition": lambda action: action.action_type not in ["ISOLATE_BATTERY", "REDUCE_LOAD", "SHUTDOWN_LOAD", "MAINTAIN_STATUS", "INSPECT", "LOG_WARNING", "INVESTIGATE"],
+        "action": "human_approval",
+        "reason": "Unrecognised action type proposed."
+    },
+    {
+        "rule_id": "rule_008",
+        "description": "Proportionality check: HIGH priority on non-severe target",
+        "condition": lambda action: action.priority == "HIGH" and action.target == "none",
+        "action": "block",
+        "reason": "HIGH priority action proposed with no specific target."
+    },
 ]
 
 
@@ -54,7 +70,7 @@ def verify_policy(action: ProposedAction, rules: List[Dict[str, Any]] = DEFAULT_
     """
     Evaluates the proposed action against the predefined ruleset.
     First rule that matches returns its decision.
-    If no rules match, defaults to block (fail-safe).
+    If no rules match, defaults to allow (fail-safe).
     """
     for rule in rules:
         try:

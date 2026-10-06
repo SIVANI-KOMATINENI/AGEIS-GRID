@@ -2,6 +2,7 @@
 aegis/risk.py
 Risk Evaluation Stage.
 Combines Policy, Provenance, and Behaviour results into a unified Risk Score.
+Uses continuous scoring logic.
 """
 
 from typing import Dict
@@ -26,18 +27,26 @@ def evaluate_risk(
     behav_res: BehaviourResult
 ) -> RiskResult:
     """
-    Weighted sum equation:
+    Weighted sum equation using continuous penalties.
     Risk = (Policy Penalty * w1) + (Provenance Penalty * w2) + (Behaviour Penalty * w3)
     """
     
     # 1. Base Penalties (0.0 means good, 1.0 means full violation/risk)
-    policy_penalty = 1.0 if policy_res.decision == "block" else 0.0
+    
+    # Policy penalty: 
+    if policy_res.decision == "block":
+        policy_penalty = 1.0
+    elif policy_res.decision == "human_approval":
+        policy_penalty = 0.5
+    else:
+        policy_penalty = 0.0
     
     # Provenance penalty: full penalty if verified=False.
     # If the policy allows it without auth, provenance sets verified=True.
     prov_penalty = 0.0 if prov_res.verified else 1.0
     
-    behav_penalty = 1.0 if behav_res.flagged else 0.0
+    # Behaviour penalty is now directly mapped to the calculated score
+    behav_penalty = behav_res.score
     
     # 2. Apply configuration weights
     w_pol = cfg.RISK_WEIGHT_POLICY
@@ -71,6 +80,6 @@ if __name__ == "__main__":
     r = evaluate_risk(
         PolicyResult(decision="allow", reason=""),
         ProvenanceResult(verified=False, trace_length=0, reason=""),
-        BehaviourResult(flagged=True)
+        BehaviourResult(flagged=True, score=0.7)
     )
     print(r.model_dump_json(indent=2))

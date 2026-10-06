@@ -60,14 +60,14 @@ def test():
     print(f" -> Decision: {res3.final_decision.upper()} | Reason: {res3.reason}")
     assert res3.final_decision == "block"
     
-    print("\nTest 4: Critical Load Shutdown (EXPECT BLOCK)")
+    print("\nTest 4: Critical Load Shutdown (EXPECT HUMAN_APPROVAL)")
     act4 = ProposedAction(
         action_id="act4", action_type="SHUTDOWN_LOAD", target="critical_load", 
         reason="Oops", priority="HIGH", claimed_authorization="report_xyz"
     )
     res4 = run_pipeline(act4)
     print(f" -> Decision: {res4.final_decision.upper()} | Reason: {res4.reason}")
-    assert res4.final_decision == "block"
+    assert res4.final_decision == "human_approval"
 
     print("\n[OK] All Milestone 4 pipeline tests passed!")
 

@@ -19,7 +19,7 @@ OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 NEO4J_URI: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER: str = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "password")
-NEO4J_DATABASE: str = os.getenv("NEO4J_DATABASE", "aegis-neo4j")
+NEO4J_DATABASE: str = os.getenv("NEO4J_DATABASE", "neo4j")
 
 # ── SQLite ────────────────────────────────────────────────────────────────────
 _sqlite_rel = os.getenv("SQLITE_PATH", "data/logs/aegis_audit.db")
