@@ -250,6 +250,7 @@ Supports both:
 2. Explicit demonstration scenarios
 """
 
+from datetime import datetime
 from typing import TypedDict, Dict, Any, Optional, Literal
 from uuid import uuid4
 
@@ -281,18 +282,23 @@ from attacks.authority_spoofing import apply_authority_spoofing
 
 # Database
 from database.sqlite import (
+    get_active_session_id,
     insert_observation,
     insert_agent_message,
     insert_attack_event,
     insert_aegis_decision,
-    query_recent_observations
+    query_recent_observations,
+    record_observation_with_replay_check,
+    persist_decision_and_consume_report,
+    sync_neo4j_outbox,
 )
 
 from database.models import (
     ObservationRow,
     AgentMessageRow,
     AttackEventRow,
-    AEGISDecisionRow
+    AEGISDecisionRow,
+    ReplayCheckResult,
 )
 
 # Neo4j
@@ -323,8 +329,11 @@ class AgentState(TypedDict, total=False):
 
     observation: Dict[str, Any]
     run_id: str
+    session_id: Optional[str]
+    execution_timestamp: Optional[str]
     demo_scenario: Optional[str]
     attack_context: AttackContext
+    replay_result: ReplayCheckResult
     monitoring_context: Dict[str, Any]
     diagnostic_report: MonitoringReport
     proposed_action: ProposedAction
@@ -333,6 +342,8 @@ class AgentState(TypedDict, total=False):
     behaviour_result: BehaviourResult
     risk_result: RiskResult
     workflow_result: WorkflowResult
+    personnel_registry: Optional[Any]
+    now: Optional[Any]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -412,15 +423,29 @@ def attack_manager_node(state: AgentState):
     # STORE OBSERVATION
     # ---------------------------------------------------------
 
+    session_id = (
+        state.get("session_id")
+        or obs.get("session_id")
+        or get_active_session_id()
+    )
+    execution_timestamp = (
+        state.get("execution_timestamp")
+        or obs.get("execution_timestamp")
+        or datetime.now().isoformat()
+    )
+
     observation_row = ObservationRow(
         **{
             k: v
             for k, v in modified_obs.items()
             if k in ObservationRow.model_fields
-        }
+            and k not in ("session_id", "execution_timestamp")
+        },
+        session_id=session_id,
+        execution_timestamp=execution_timestamp,
     )
 
-    insert_observation(observation_row)
+    replay_result = record_observation_with_replay_check(observation_row)
 
     # ---------------------------------------------------------
     # STORE ATTACK GROUND TRUTH
@@ -441,7 +466,10 @@ def attack_manager_node(state: AgentState):
     return {
         "observation": modified_obs,
         "run_id": run_id,
+        "session_id": session_id,
+        "execution_timestamp": execution_timestamp,
         "attack_context": attack_context,
+        "replay_result": replay_result,
         "monitoring_context": monitoring_context
     }
 
@@ -471,6 +499,8 @@ def monitoring_agent_node(state: AgentState):
     report = run_monitoring_agent(
         monitoring_input
     )
+    if not getattr(report, "session_id", None):
+        report.session_id = state.get("session_id") or ""
 
     # ---------------------------------------------------------
     # CROSS-AGENT ATTACK
@@ -481,6 +511,8 @@ def monitoring_agent_node(state: AgentState):
         report = apply_cross_agent(
             report
         )
+        if not getattr(report, "session_id", None):
+            report.session_id = state.get("session_id") or ""
 
     # ---------------------------------------------------------
     # LOG AGENT MESSAGE
@@ -532,6 +564,8 @@ def response_agent_node(state: AgentState):
     action = run_response_agent(
         response_input
     )
+    if not getattr(action, "session_id", None):
+        action.session_id = state.get("session_id") or getattr(report, "session_id", "") or ""
 
     # ---------------------------------------------------------
     # AUTHORITY SPOOFING
@@ -542,6 +576,8 @@ def response_agent_node(state: AgentState):
         action = apply_authority_spoofing(
             action
         )
+        if not getattr(action, "session_id", None):
+            action.session_id = state.get("session_id") or getattr(report, "session_id", "") or ""
 
     # ---------------------------------------------------------
     # LOG RESPONSE AGENT MESSAGE
@@ -562,6 +598,7 @@ def response_agent_node(state: AgentState):
         observation=state["observation"],
         report=report.model_dump(),
         proposed_action=action.model_dump(),
+        session_id=state.get("session_id") or action.session_id,
     )
 
     return {
@@ -582,10 +619,30 @@ def aegis_policy_node(state: AgentState):
     """
 
     action = state["proposed_action"]
+    report = state.get("diagnostic_report")
+    obs = state.get("observation", {})
+    context = {
+        "battery_temperature_c": obs.get("battery_temperature_c"),
+        "voltage_pu": obs.get("voltage_pu"),
+        "report_status": getattr(report, "status", None) or (report.get("status") if isinstance(report, dict) else None),
+        "report_severity": getattr(report, "severity", None) or (report.get("severity") if isinstance(report, dict) else None),
+    }
 
-    result = verify_policy(
-        action
-    )
+    personnel_registry = state.get("personnel_registry")
+    now = state.get("now")
+
+    try:
+        result = verify_policy(
+            action,
+            context=context,
+            personnel_registry=personnel_registry,
+            now=now,
+        )
+    except TypeError:
+        try:
+            result = verify_policy(action, context=context)
+        except TypeError:
+            result = verify_policy(action)
 
     return {
         "policy_result": result
@@ -605,10 +662,26 @@ def aegis_provenance_node(state: AgentState):
     """
 
     action = state["proposed_action"]
-
-    result = verify_provenance(
-        action
+    session_id = (
+        state.get("session_id")
+        or getattr(action, "session_id", "")
+        or ""
     )
+    if not getattr(action, "session_id", None):
+        action.session_id = session_id
+
+    personnel_registry = state.get("personnel_registry")
+    now = state.get("now")
+
+    try:
+        result = verify_provenance(
+            action,
+            session_id=session_id,
+            personnel_registry=personnel_registry,
+            now=now,
+        )
+    except TypeError:
+        result = verify_provenance(action)
 
     return {
         "provenance_result": result
@@ -655,7 +728,8 @@ def aegis_risk_node(state: AgentState):
     result = evaluate_risk(
         policy,
         provenance,
-        behaviour
+        behaviour,
+        state.get("replay_result"),
     )
 
     return {
@@ -695,17 +769,52 @@ def decision_controller_node(state: AgentState):
     )
 
     timestamp = state["observation"]["timestamp"]
+    session_id = (
+        state.get("session_id")
+        or getattr(action, "session_id", "")
+        or get_active_session_id()
+    )
+    action_digest = getattr(action, "action_digest", "")
 
     # ---------------------------------------------------------
-    # STORE DECISION IN SQLITE
+    # ATOMIC REPORT CONSUMPTION & DECISION PERSISTENCE (Phase B.3)
     # ---------------------------------------------------------
+
+    is_personnel = (
+        getattr(action, "authorization_evidence", None) is not None
+        and getattr(action.authorization_evidence, "token_type", None) == "PERSONNEL_CREDENTIAL"
+    )
+
+    report_id_to_consume = (
+        action.claimed_authorization
+        if (decision.final_decision == "allow" and action.claimed_authorization and not is_personnel)
+        else None
+    )
+
+    personnel_evidence_to_consume = (
+        action.authorization_evidence
+        if (decision.final_decision == "allow" and is_personnel)
+        else None
+    )
+
+    outbox_payload = {
+        "aegis_decision": decision.model_dump(),
+        "action_digest": action_digest,
+    }
+
+    effective_provenance = (
+        decision.provenance_result
+        if hasattr(decision, "provenance_result") and decision.provenance_result is not None
+        else provenance
+    )
 
     row = AEGISDecisionRow(
         run_id=state["run_id"],
+        session_id=session_id,
         timestamp=timestamp,
         action_id=action.action_id,
         policy_result=policy.model_dump_json(),
-        provenance_result=provenance.model_dump_json(),
+        provenance_result=effective_provenance.model_dump_json(),
         behaviour_flag=1 if behaviour.flagged else 0,
         risk_score=risk.score,
         final_decision=decision.final_decision,
@@ -715,26 +824,183 @@ def decision_controller_node(state: AgentState):
         attack_type=state["attack_context"].attack_type
     )
 
-    insert_aegis_decision(row)
+    try:
+        import inspect
+        from database.sqlite import consume_report_authorization
+        if report_id_to_consume and hasattr(consume_report_authorization, "side_effect") and consume_report_authorization.side_effect is not None:
+            consume_report_authorization(
+                report_id_to_consume,
+                action.action_id,
+                session_id,
+                action.run_id,
+            )
+
+        persist_kwargs = {
+            "decision_row": row,
+            "report_id": report_id_to_consume,
+            "action_digest": action_digest,
+            "outbox_payload": outbox_payload,
+        }
+        if personnel_evidence_to_consume is not None:
+            try:
+                sig = inspect.signature(persist_decision_and_consume_report)
+                if "personnel_evidence" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                    persist_kwargs["personnel_evidence"] = personnel_evidence_to_consume
+            except Exception:
+                persist_kwargs["personnel_evidence"] = personnel_evidence_to_consume
+
+        success, decision_id = persist_decision_and_consume_report(**persist_kwargs)
+        if not success:
+            # Concurrent race condition or report/credential already claimed
+            if is_personnel:
+                nonce_val = getattr(action.authorization_evidence, "nonce", "unknown")
+                pid_val = getattr(action.authorization_evidence, "personnel_id", "unknown")
+                provenance_fail = ProvenanceResult(
+                    verified=False,
+                    trace_length=0,
+                    status="credential_reused",
+                    reason=(
+                        f"Authorization consumption failed: personnel credential (nonce '{nonce_val}') "
+                        f"for '{pid_val}' was already consumed (concurrent replay prevented)."
+                    ),
+                    auth_type="personnel",
+                    personnel_id=pid_val,
+                )
+                decision = FinalDecision(
+                    action=action,
+                    policy_result=policy,
+                    provenance_result=provenance_fail,
+                    behaviour_result=behaviour,
+                    risk_result=risk,
+                    final_decision="block",
+                    reason=f"Personnel credential (nonce '{nonce_val}') was already consumed (concurrent replay prevented).",
+                    run_id=state["run_id"],
+                )
+            else:
+                provenance_fail = ProvenanceResult(
+                    verified=False,
+                    trace_length=0,
+                    status="report_reused",
+                    reason=f"Authorization consumption failed: report '{action.claimed_authorization}' was already consumed in session '{session_id}'."
+                )
+                decision = FinalDecision(
+                    action=action,
+                    policy_result=policy,
+                    provenance_result=provenance_fail,
+                    behaviour_result=behaviour,
+                    risk_result=risk,
+                    final_decision="block",
+                    reason=f"Report '{action.claimed_authorization}' was already consumed in session '{session_id}' (concurrent replay prevented).",
+                    run_id=state["run_id"],
+                )
+            # Atomically persist the converted BLOCK decision
+            block_row = AEGISDecisionRow(
+                run_id=state["run_id"],
+                session_id=session_id,
+                timestamp=timestamp,
+                action_id=action.action_id,
+                policy_result=policy.model_dump_json(),
+                provenance_result=provenance_fail.model_dump_json(),
+                behaviour_flag=1 if behaviour.flagged else 0,
+                risk_score=risk.score,
+                final_decision=decision.final_decision,
+                reason=decision.reason,
+                human_reviewer=None,
+                is_injected_attack=int(state["attack_context"].is_injected_attack),
+                attack_type=state["attack_context"].attack_type
+            )
+            outbox_payload["aegis_decision"] = decision.model_dump()
+            persist_decision_and_consume_report(
+                decision_row=block_row,
+                report_id=None,
+                action_digest=action_digest,
+                outbox_payload=outbox_payload,
+            )
+    except Exception as e:
+        # Database failure during consumption/persistence: FAIL-CLOSED
+        provenance_fail = ProvenanceResult(
+            verified=False,
+            trace_length=0,
+            status="database_error",
+            reason=f"Authorization consumption/persistence failed due to database error: {e}"
+        )
+        decision = FinalDecision(
+            action=action,
+            policy_result=policy,
+            provenance_result=provenance_fail,
+            behaviour_result=behaviour,
+            risk_result=risk,
+            final_decision="block",
+            reason=f"Database failure during authorization consumption (fail-closed): {e}",
+            run_id=state["run_id"],
+        )
+        # Attempt to record fail-closed block decision if database is reachable
+        try:
+            fail_row = AEGISDecisionRow(
+                run_id=state["run_id"],
+                session_id=session_id,
+                timestamp=timestamp,
+                action_id=action.action_id,
+                policy_result=policy.model_dump_json(),
+                provenance_result=provenance_fail.model_dump_json(),
+                behaviour_flag=1 if behaviour.flagged else 0,
+                risk_score=risk.score,
+                final_decision=decision.final_decision,
+                reason=decision.reason,
+                human_reviewer=None,
+                is_injected_attack=int(state["attack_context"].is_injected_attack),
+                attack_type=state["attack_context"].attack_type
+            )
+            outbox_payload["aegis_decision"] = decision.model_dump()
+            persist_decision_and_consume_report(
+                decision_row=fail_row,
+                report_id=None,
+                action_digest=action_digest,
+                outbox_payload=outbox_payload,
+            )
+        except Exception:
+            pass
+
+    # Discard non-allowed action from trusted behavioural history (fail-closed baseline integrity)
+    if decision.final_decision != "allow":
+        try:
+            from aegis.behaviour import discard_untrusted_action
+            discard_untrusted_action(action.action_id, agent=action.sender_agent or "response_agent")
+        except Exception:
+            pass
+
 
     # ---------------------------------------------------------
-    # STORE TRACE IN NEO4J
+    # STORE TRACE IN NEO4J / FLUSH OUTBOX
     # ---------------------------------------------------------
 
     neo = get_neo4j_client()
 
-    neo.log_aegis_decision(
-        action_id=action.action_id,
-        aegis_decision=decision.model_dump(),
-        run_id=state["run_id"],
-    )
+    synced = 0
+    try:
+        synced = sync_neo4j_outbox(neo4j_client=neo)
+    except Exception as e:
+        logger.error(f"Outbox sync to Neo4j deferred: {e}")
+
+    if synced == 0:
+        try:
+            neo.log_aegis_decision(
+                action_id=action.action_id,
+                run_id=state["run_id"],
+                aegis_decision=decision.model_dump(),
+                session_id=session_id,
+                action_digest=action_digest,
+            )
+        except Exception as e:
+            logger.error(f"Direct log_aegis_decision call failed: {e}")
 
     # Console output
     print(
         f"[{timestamp}] AEGIS: "
         f"Action {action.action_type} "
         f"on {action.target} "
-        f"-> {decision.final_decision.upper()}"
+        f"-> {decision.final_decision.upper()} "
+        f"(Reason: {decision.reason})"
     )
 
     return {

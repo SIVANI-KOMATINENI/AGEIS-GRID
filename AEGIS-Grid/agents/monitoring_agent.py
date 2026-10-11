@@ -209,7 +209,7 @@ def _merge_diagnoses(
     rule_status: str, rule_severity: str, rule_issues: List[str],
     rule_evidence: Dict[str, Any], rule_action: Optional[str],
     llm_data: Optional[Dict[str, Any]],
-    timestamp: str, run_id: str
+    timestamp: str, run_id: str, session_id: str = ""
 ) -> MonitoringReport:
     """
     Merges rule-based and LLM-based diagnoses.
@@ -222,6 +222,7 @@ def _merge_diagnoses(
     if llm_data is None:
         return MonitoringReport(
             run_id=run_id,
+            session_id=session_id,
             report_id=report_id,
             timestamp=timestamp,
             status=rule_status,
@@ -232,68 +233,81 @@ def _merge_diagnoses(
             confidence=1.0  # Rules are deterministic
         )
 
-    # Normalise LLM outputs
-    llm_status = str(llm_data.get("status", "NORMAL")).upper().strip()
-    llm_severity = str(llm_data.get("severity", "NONE")).upper().strip()
+    # Validate schema of LLM output
+    if not isinstance(llm_data, dict):
+        llm_data = {}
 
-    # Fix common LLM mistakes
-    if llm_status == "ABNORMAL":
-        llm_status = "ANOMALY"
-    if llm_status not in VALID_STATUSES:
-        llm_status = rule_status
-    if llm_severity not in VALID_SEVERITIES:
-        llm_severity = rule_severity
+    # Normalise and validate LLM outputs against schema and allowed values
+    raw_status = str(llm_data.get("status", "NORMAL")).upper().strip()
+    if raw_status == "ABNORMAL":
+        raw_status = "ANOMALY"
+    llm_status = raw_status if raw_status in VALID_STATUSES else rule_status
+
+    raw_severity = str(llm_data.get("severity", "NONE")).upper().strip()
+    llm_severity = raw_severity if raw_severity in VALID_SEVERITIES else rule_severity
+
+    try:
+        llm_confidence = max(0.0, min(1.0, float(llm_data.get("confidence", 0.5))))
+    except (ValueError, TypeError):
+        llm_confidence = 0.5
 
     # MERGE LOGIC:
-    # 1. If rules detected HIGH and LLM says NORMAL -> rules win (LLM missed it)
-    # 2. If rules say NORMAL and LLM says ANOMALY -> use LLM but cap at MEDIUM
-    #    (LLM might see patterns rules don't, but we don't fully trust it)
-    # 3. If both agree -> use LLM reasoning (richer text)
-
+    # Deterministic checks based on actual microgrid telemetry remain authoritative
+    # for physical safety conditions. LLM output is a secondary hypothesis, not verified evidence.
     if SEVERITY_RANK.get(rule_severity, 0) >= SEVERITY_RANK.get("HIGH", 3):
-        # Rules found something critical - rules always win
+        # 1. Deterministic rules found a critical physical threshold breach: rules always win
         final_status = rule_status
         final_severity = rule_severity
         final_issues = rule_issues
-        final_evidence = rule_evidence
+        final_evidence = dict(rule_evidence)
+        if llm_data.get("evidence"):
+            final_evidence["llm_notes"] = llm_data.get("evidence")
         final_action = rule_action
         confidence = 1.0
     elif rule_status == "NORMAL" and llm_status == "ANOMALY":
-        # LLM sees something rules didn't - cautiously trust but cap severity
-        final_status = "ANOMALY"
-        capped = min(SEVERITY_RANK.get(llm_severity, 1), SEVERITY_RANK.get("MEDIUM", 2))
-        final_severity = {0: "NONE", 1: "LOW", 2: "MEDIUM", 3: "HIGH"}.get(capped, "MEDIUM")
-        final_issues = [llm_data.get("issue", "LLM-detected anomaly")]
-        final_evidence = llm_data.get("evidence", {})
-        final_action = llm_data.get("recommended_action", rule_action)
-        confidence = min(float(llm_data.get("confidence", 0.5)), 0.7)
+        # 2. Hallucination Guard: Physical telemetry was verified normal by deterministic checks.
+        # An LLM cannot independently convert normal telemetry into a confirmed anomaly without
+        # corroborating evidence. Keep final diagnosis NORMAL, but preserve LLM hypothesis for review.
+        final_status = "NORMAL"
+        final_severity = "NONE"
+        final_issues = []
+        final_evidence = dict(rule_evidence)
+        final_evidence["unverified_llm_hypothesis"] = {
+            "status": llm_status,
+            "severity": llm_severity,
+            "issue": str(llm_data.get("issue", "Uncorroborated anomaly hypothesis")),
+            "recommended_action": llm_data.get("recommended_action"),
+            "confidence": llm_confidence,
+        }
+        final_action = rule_action
+        confidence = 0.85
     elif rule_status == "ANOMALY" and llm_status == "ANOMALY":
-        # Both agree - use LLM reasoning but keep rule severity if higher
+        # 3. Both agree on anomaly: use higher severity and enrich reasoning
         final_status = "ANOMALY"
         if SEVERITY_RANK.get(rule_severity, 0) > SEVERITY_RANK.get(llm_severity, 0):
             final_severity = rule_severity
         else:
             final_severity = llm_severity
-        # Combine evidence
         final_evidence = dict(rule_evidence)
-        final_evidence.update(llm_data.get("evidence", {}))
-        # Use LLM issue text (richer) but append rule issues
-        llm_issue = llm_data.get("issue", "")
+        if isinstance(llm_data.get("evidence"), dict):
+            final_evidence.update(llm_data["evidence"])
+        llm_issue = str(llm_data.get("issue", "")).strip()
         final_issues = [llm_issue] if llm_issue else []
         final_issues.extend(rule_issues)
         final_action = llm_data.get("recommended_action", rule_action)
-        confidence = float(llm_data.get("confidence", 0.8))
+        confidence = max(0.8, llm_confidence)
     else:
-        # Both say NORMAL
+        # 4. Both agree normal
         final_status = "NORMAL"
         final_severity = "NONE"
         final_issues = []
-        final_evidence = rule_evidence or llm_data.get("evidence", {})
-        final_action = llm_data.get("recommended_action", rule_action)
-        confidence = float(llm_data.get("confidence", 0.9))
+        final_evidence = rule_evidence or (llm_data.get("evidence") if isinstance(llm_data.get("evidence"), dict) else {})
+        final_action = rule_action
+        confidence = 0.95
 
     return MonitoringReport(
         run_id=run_id,
+        session_id=session_id,
         report_id=report_id,
         timestamp=timestamp,
         status=final_status,
@@ -317,6 +331,7 @@ def run_monitoring_agent(inputs: MonitoringInput | dict) -> MonitoringReport:
     agent_input = MonitoringInput.model_validate(inputs)
     timestamp = agent_input.current.get("timestamp", "unknown")
     run_id = agent_input.current.get("run_id", "")
+    session_id = agent_input.current.get("session_id", "")
 
     # Step 1: Deterministic rules (always runs, never fails)
     rule_status, rule_severity, rule_issues, rule_evidence = _run_deterministic_rules(
@@ -331,10 +346,26 @@ def run_monitoring_agent(inputs: MonitoringInput | dict) -> MonitoringReport:
     report = _merge_diagnoses(
         rule_status, rule_severity, rule_issues,
         rule_evidence, rule_action,
-        llm_data, timestamp, run_id
+        llm_data, timestamp, run_id, session_id
     )
 
     return report
+
+
+def _fallback_rule_based_diagnosis(agent_input: MonitoringInput) -> MonitoringReport:
+    """Deterministic rule-based diagnosis used as a baseline and fallback."""
+    timestamp = agent_input.current.get("timestamp", "unknown")
+    run_id = agent_input.current.get("run_id", "")
+    session_id = agent_input.current.get("session_id", "")
+    rule_status, rule_severity, rule_issues, rule_evidence = _run_deterministic_rules(
+        agent_input.current, agent_input.recent_history
+    )
+    rule_action = _build_recommended_action(rule_severity, rule_issues)
+    return _merge_diagnoses(
+        rule_status, rule_severity, rule_issues,
+        rule_evidence, rule_action,
+        None, timestamp, run_id, session_id
+    )
 
 
 if __name__ == "__main__":

@@ -82,6 +82,7 @@ def _deterministic_response(report: MonitoringReport) -> ProposedAction:
         return ProposedAction(
             action_id=action_id,
             run_id=report.run_id,
+            session_id=report.session_id,
             action_type="MAINTAIN_STATUS",
             target="none",
             reason="System operating normally. No action required.",
@@ -99,6 +100,7 @@ def _deterministic_response(report: MonitoringReport) -> ProposedAction:
             return ProposedAction(
                 action_id=action_id,
                 run_id=report.run_id,
+                session_id=report.session_id,
                 action_type=mapping["action_type"],
                 target=mapping["target"],
                 reason="Rule-based: %s" % (report.issue or "Anomaly detected"),
@@ -110,6 +112,7 @@ def _deterministic_response(report: MonitoringReport) -> ProposedAction:
     return ProposedAction(
         action_id=action_id,
         run_id=report.run_id,
+        session_id=report.session_id,
         action_type="INVESTIGATE",
         target="unknown",
         reason="Rule-based: Anomaly detected but cause unclear. %s" % (report.issue or ""),
@@ -178,6 +181,7 @@ def _sanitize_action(
     # 1. Force deterministic IDs (never trust LLM for these)
     llm_data["action_id"] = "act_%s" % report.timestamp
     llm_data["run_id"] = report.run_id
+    llm_data["session_id"] = report.session_id
     llm_data["claimed_authorization"] = report.report_id
 
     # 2. Clamp action_type
@@ -212,13 +216,14 @@ def _sanitize_action(
     llm_data["priority"] = raw_priority
 
     # 5. Proportionality check
-    # If monitoring says NORMAL/NONE but LLM proposes HIGH, demote to MEDIUM
-    if report.severity in ("NONE", "LOW") and llm_data["priority"] == "HIGH":
-        llm_data["priority"] = "MEDIUM"
-        llm_data["reason"] = "(Demoted from HIGH) " + str(llm_data.get("reason", ""))
+    # If monitoring says NORMAL/NONE, priority must remain LOW
+    if report.status == "NORMAL" or report.severity in ("NONE", "LOW"):
+        if llm_data["priority"] in ("MEDIUM", "HIGH"):
+            llm_data["priority"] = "LOW"
+            llm_data["reason"] = "(Demoted: normal microgrid status) " + str(llm_data.get("reason", ""))
 
-    # If monitoring says NORMAL but LLM proposes destructive action, override
-    if report.status == "NORMAL" and llm_data["action_type"] in ("SHUTDOWN_LOAD", "ISOLATE_BATTERY"):
+    # If monitoring says NORMAL but LLM proposes disruptive/severe action, override to deterministic baseline
+    if report.status == "NORMAL" and llm_data["action_type"] in ("SHUTDOWN_LOAD", "ISOLATE_BATTERY", "REDUCE_LOAD"):
         return rule_action  # Fall back to MAINTAIN_STATUS
 
     # 6. Rate limiting check
@@ -267,6 +272,11 @@ def run_response_agent(inputs: ResponseInput | dict) -> ProposedAction:
     action = _sanitize_action(llm_data, rule_action, report)
 
     return action
+
+
+def _fallback_rule_based_response(agent_input: ResponseInput) -> ProposedAction:
+    """Deterministic rule-based response used as a baseline and fallback."""
+    return _deterministic_response(agent_input.diagnostic_report)
 
 
 if __name__ == "__main__":

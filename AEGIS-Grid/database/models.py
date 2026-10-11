@@ -14,6 +14,11 @@ from pydantic import BaseModel, Field
 class ObservationRow(BaseModel):
     """Maps to the `observations` SQLite table."""
     run_id: Optional[str] = None
+    session_id: Optional[str] = None
+    execution_timestamp: Optional[str] = None
+    fingerprint: Optional[str] = None
+    replay_detected: bool = False
+    replay_reason: Optional[str] = None
     timestamp: str
     voltage_pu: float
     load_kw: float
@@ -21,6 +26,15 @@ class ObservationRow(BaseModel):
     battery_soc_pct: float
     battery_temperature_c: float
     transformer_loading_pct: float
+
+
+class ReplayCheckResult(BaseModel):
+    detected: bool
+    reason: str
+    fingerprint: str
+    observation_timestamp: str
+    run_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class AgentMessageRow(BaseModel):
@@ -45,6 +59,7 @@ class AttackEventRow(BaseModel):
 class AEGISDecisionRow(BaseModel):
     """Maps to the `aegis_decisions` SQLite table."""
     run_id: Optional[str] = None
+    session_id: Optional[str] = None
     timestamp: str
     action_id: str
     policy_result: str          # JSON-serialized PolicyResult

@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 from datetime import datetime
 from io import StringIO
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -130,7 +131,19 @@ class WorkflowNormalPathTest(unittest.TestCase):
             patch.object(graph, "evaluate_risk", wraps=real_evaluate_risk) as risk,
             patch.object(graph, "make_decision", wraps=real_make_decision) as decision,
             patch.object(graph, "query_recent_observations", return_value=[]),
-            patch.object(graph, "insert_observation"),
+            patch.object(
+                graph,
+                "record_observation_with_replay_check",
+                side_effect=lambda observation: graph.ReplayCheckResult(
+                    detected=False,
+                    reason="Fresh test observation.",
+                    fingerprint=sqlite_db.observation_fingerprint(
+                        observation.model_dump()
+                    ),
+                    observation_timestamp=observation.timestamp,
+                    run_id=observation.run_id,
+                ),
+            ),
             patch.object(graph, "insert_agent_message"),
             patch.object(graph, "insert_attack_event") as insert_attack,
             patch.object(graph, "insert_aegis_decision"),
@@ -269,6 +282,35 @@ class WorkflowNormalPathTest(unittest.TestCase):
         self.assertIn("Band : LOW", output.getvalue())
         self.assertIn(">>> ALLOW", output.getvalue())
 
+    def test_detected_replay_cannot_result_in_allow_decision(self):
+        action = ProposedAction(
+            action_id="act_replay_gate",
+            sender_agent="response_agent",
+            action_type="MAINTAIN_STATUS",
+            target="none",
+            reason="Benign action on replayed telemetry.",
+            priority="LOW",
+        )
+        policy_res = PolicyResult(decision="allow", reason="Policy passed.")
+        prov_res = ProvenanceResult(verified=True, trace_length=3, reason="Verified.")
+        behav_res = BehaviourResult(flagged=False, score=0.0)
+
+        # Simulating detected replay
+        replay_res = graph.ReplayCheckResult(
+            detected=True,
+            reason="Replay detected in observation stream.",
+            fingerprint="fake_fingerprint",
+            observation_timestamp="10:00",
+        )
+        risk_res = graph.evaluate_risk(policy_res, prov_res, behav_res, replay_result=replay_res)
+        self.assertTrue(risk_res.replay_detected)
+        self.assertEqual(risk_res.score, 1.0)
+        self.assertEqual(risk_res.band, "HIGH")
+
+        decision = graph.make_decision(action, policy_res, prov_res, behav_res, risk_res)
+        self.assertEqual(decision.final_decision, "block")
+        self.assertIn("replay", decision.reason.lower())
+
 
 class WorkflowSQLiteIntegrationTest(unittest.TestCase):
     def setUp(self):
@@ -309,16 +351,50 @@ class WorkflowSQLiteIntegrationTest(unittest.TestCase):
             patch.object(
                 graph,
                 "run_monitoring_agent",
-                side_effect=lambda inputs: report.model_copy(
-                    update={"run_id": inputs.current["run_id"]}
-                ),
+                side_effect=lambda inputs: report.model_copy(update={
+                    "run_id": inputs.current["run_id"],
+                    "timestamp": inputs.current["timestamp"],
+                    "report_id": f"rep_{inputs.current['timestamp']}",
+                    "evidence": {
+                        "battery_temperature_c": inputs.current.get(
+                            "battery_temperature_c"
+                        )
+                    },
+                    "status": (
+                        "ANOMALY"
+                        if inputs.current.get("battery_temperature_c", 30.0) > 60.0
+                        else "NORMAL"
+                    ),
+                    "severity": (
+                        "HIGH"
+                        if inputs.current.get("battery_temperature_c", 30.0) > 60.0
+                        else "NONE"
+                    ),
+                }),
             ) as monitor,
             patch.object(
                 graph,
                 "run_response_agent",
-                side_effect=lambda inputs: action.model_copy(
-                    update={"run_id": inputs.diagnostic_report.run_id}
-                ),
+                side_effect=lambda inputs: action.model_copy(update={
+                    "run_id": inputs.diagnostic_report.run_id,
+                    "action_id": f"act_{inputs.diagnostic_report.timestamp}",
+                    "claimed_authorization": inputs.diagnostic_report.report_id,
+                    "action_type": (
+                        "ISOLATE_BATTERY"
+                        if inputs.diagnostic_report.status == "ANOMALY"
+                        else "MAINTAIN_STATUS"
+                    ),
+                    "target": (
+                        "battery_1"
+                        if inputs.diagnostic_report.status == "ANOMALY"
+                        else "none"
+                    ),
+                    "priority": (
+                        "HIGH"
+                        if inputs.diagnostic_report.status == "ANOMALY"
+                        else "LOW"
+                    ),
+                }),
             ),
             patch.object(graph, "verify_provenance", return_value=ProvenanceResult(
                 verified=True,
@@ -335,8 +411,8 @@ class WorkflowSQLiteIntegrationTest(unittest.TestCase):
             ),
             patch.object(
                 graph,
-                "insert_observation",
-                side_effect=lambda row: sqlite_db.insert_observation(
+                "record_observation_with_replay_check",
+                side_effect=lambda row: sqlite_db.record_observation_with_replay_check(
                     row,
                     db_path=self.db_path,
                 ),
@@ -363,6 +439,26 @@ class WorkflowSQLiteIntegrationTest(unittest.TestCase):
                 side_effect=lambda row: sqlite_db.insert_aegis_decision(
                     row,
                     db_path=self.db_path,
+                ),
+            ),
+            patch.object(
+                graph,
+                "persist_decision_and_consume_report",
+                side_effect=lambda decision_row, report_id=None, action_digest=None, outbox_payload=None: sqlite_db.persist_decision_and_consume_report(
+                    decision_row=decision_row,
+                    report_id=report_id,
+                    action_digest=action_digest,
+                    outbox_payload=outbox_payload,
+                    db_path=self.db_path,
+                ),
+            ),
+            patch.object(
+                graph,
+                "sync_neo4j_outbox",
+                side_effect=lambda neo4j_client=None, limit=50: sqlite_db.sync_neo4j_outbox(
+                    db_path=self.db_path,
+                    neo4j_client=neo4j_client,
+                    limit=limit,
                 ),
             ),
             patch.object(graph, "get_neo4j_client", return_value=neo4j_client),
@@ -449,6 +545,55 @@ class WorkflowSQLiteIntegrationTest(unittest.TestCase):
             first["observation"]["run_id"],
             second["observation"]["run_id"],
         )
+
+    def test_scheduled_replay_is_audited_excluded_and_blocked(self):
+        latest_accepted = {
+            "timestamp": "12:00",
+            "voltage_pu": 1.0,
+            "load_kw": 25.0,
+            "solar_kw": 5.0,
+            "battery_soc_pct": 60.0,
+            "battery_temperature_c": 30.0,
+            "transformer_loading_pct": 12.0,
+        }
+        sqlite_db.insert_observation(
+            sqlite_db.ObservationRow(
+                **latest_accepted,
+                fingerprint=sqlite_db.observation_fingerprint(latest_accepted),
+            ),
+            db_path=self.db_path,
+        )
+
+        state, monitor = self.run_workflow_with_persistence("20:11")
+
+        replay_result = state["replay_result"]
+        self.assertTrue(replay_result.detected)
+        self.assertEqual(replay_result.observation_timestamp, "04:00")
+        self.assertEqual(replay_result.run_id, state["run_id"])
+        self.assertIn("predates", replay_result.reason)
+        self.assertEqual(state["observation"]["timestamp"], "04:00")
+        self.assertEqual(monitor.call_args.args[0].current["timestamp"], "04:00")
+        self.assertTrue(state["risk_result"].replay_detected)
+        self.assertEqual(state["risk_result"].score, 1.0)
+        self.assertEqual(state["risk_result"].band, "HIGH")
+        self.assertEqual(state["workflow_result"].final_decision, "block")
+
+        audit_connection = sqlite3.connect(self.db_path)
+        try:
+            replay_row = audit_connection.execute(
+                """SELECT fingerprint, replay_detected, replay_reason, run_id
+                   FROM observations WHERE timestamp = '04:00'"""
+            ).fetchone()
+        finally:
+            audit_connection.close()
+        self.assertIsNotNone(replay_row)
+        self.assertEqual(len(replay_row[0]), 64)  # SHA-256 fingerprint
+        self.assertEqual(replay_row[1], 1)  # replay_detected
+        self.assertIn("predates", replay_row[2])  # replay_reason
+        self.assertEqual(replay_row[3], state["run_id"])
+
+        trusted_history = sqlite_db.query_recent_observations(10, self.db_path)
+        self.assertTrue(all(row["timestamp"] != "04:00" for row in trusted_history))
 
 
 if __name__ == "__main__":

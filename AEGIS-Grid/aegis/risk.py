@@ -5,13 +5,14 @@ Combines Policy, Provenance, and Behaviour results into a unified Risk Score.
 Uses continuous scoring logic.
 """
 
-from typing import Dict
+from typing import Dict, Optional
 from pydantic import BaseModel
 
 import config as cfg
 from aegis.policy import PolicyResult
 from aegis.provenance import ProvenanceResult
 from aegis.behaviour import BehaviourResult
+from database.models import ReplayCheckResult
 
 
 class RiskResult(BaseModel):
@@ -19,12 +20,14 @@ class RiskResult(BaseModel):
     score: float       # 0.0 to 1.0
     band: str          # "LOW", "MEDIUM", "HIGH"
     contributing_factors: Dict[str, float]
+    replay_detected: bool = False
 
 
 def evaluate_risk(
     policy_res: PolicyResult, 
     prov_res: ProvenanceResult, 
-    behav_res: BehaviourResult
+    behav_res: BehaviourResult,
+    replay_result: Optional[ReplayCheckResult] = None,
 ) -> RiskResult:
     """
     Weighted sum equation using continuous penalties.
@@ -47,6 +50,7 @@ def evaluate_risk(
     
     # Behaviour penalty is now directly mapped to the calculated score
     behav_penalty = behav_res.score
+    replay_detected = bool(replay_result and replay_result.detected)
     
     # 2. Apply configuration weights
     w_pol = cfg.RISK_WEIGHT_POLICY
@@ -55,6 +59,11 @@ def evaluate_risk(
     
     score = (policy_penalty * w_pol) + (prov_penalty * w_pro) + (behav_penalty * w_beh)
     
+    # A replay is a direct security signal; map it into the existing HIGH-risk
+    # path so the existing Decision Controller returns BLOCK.
+    if replay_detected:
+        score = 1.0
+
     # Normalise score to exactly 0..1 to prevent floating point drift
     score = max(0.0, min(1.0, score))
     
@@ -72,8 +81,10 @@ def evaluate_risk(
         contributing_factors={
             "policy": float(policy_penalty * w_pol),
             "provenance": float(prov_penalty * w_pro),
-            "behaviour": float(behav_penalty * w_beh)
-        }
+            "behaviour": float(behav_penalty * w_beh),
+            "replay": 1.0 if replay_detected else 0.0,
+        },
+        replay_detected=replay_detected,
     )
 
 if __name__ == "__main__":

@@ -263,7 +263,7 @@ import pandapower as pp
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from database.sqlite import init_db
+from database.sqlite import init_db, start_simulation_session
 
 from microgrid.network import create_microgrid
 from microgrid.profiles import get_profiles_at_minute
@@ -425,11 +425,13 @@ def main():
     # 0. DATABASE
     # ---------------------------------------------------------
 
-    print("\n[0] INITIALIZING DATABASE")
+    print("\n[0] INITIALIZING DATABASE & SESSION")
 
     init_db()
+    session_id = start_simulation_session(description=f"Demonstration run for scenario: {scenario}")
 
     print("    [OK] SQLite database ready")
+    print(f"    [OK] Active session ID: {session_id}")
 
     # ---------------------------------------------------------
     # 1. SCENARIO
@@ -543,7 +545,8 @@ def main():
 
     initial_state = {
         "observation": observation,
-        "demo_scenario": scenario
+        "demo_scenario": scenario,
+        "session_id": session_id,
     }
 
     # ---------------------------------------------------------
